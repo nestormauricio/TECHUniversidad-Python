@@ -1,67 +1,38 @@
 ﻿import pika
 import sqlite3
-import json
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
-DB_FILE = "mensajes.db"
-LOG_FILE = "mensajes.log"
-EXCHANGE_NAME = "logs_topic"
-EXCHANGE_TYPE = "topic"
-ROUTING_KEYS = ["#", "sistema.info", "sistema.warning", "*.error", "app.*"]
+TIPO_CONSUMER = 'all'  # Reemplazar por tipo del consumer
+QUEUE = 'consumer_topic_all'
 
-# Conectar SQLite y crear tabla si no existe
-# conn = sqlite3.connect(DB_FILE)
-conn = sqlite3.connect(DB_FILE, timeout=10, check_same_thread=False)
+def filtrar_mensaje(routing_key: str, tipo: str) -> bool:
+    if tipo == "all":
+        return True
+    return routing_key.startswith(tipo)
 
-cursor = conn.cursor()
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS mensajes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    routing_key TEXT,
-    body TEXT,
-    timestamp TEXT
-)
-""")
-conn.commit()
-
-# Conexión RabbitMQ
-connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
-channel = connection.channel()
-channel.exchange_declare(exchange=EXCHANGE_NAME, exchange_type=EXCHANGE_TYPE)
-result = channel.queue_declare(queue='', exclusive=True)
-queue_name = result.method.queue
-
-# Bind a todas las routing keys
-for key in ROUTING_KEYS:
-    channel.queue_bind(exchange=EXCHANGE_NAME, queue=queue_name, routing_key=key)
-
-print(f"[*] Esperando mensajes en {queue_name}. CTRL+C para salir")
+def procesar_msg(msg):
+    # Persistencia en SQLite
+    conn = sqlite3.connect("mensajes.db", isolation_level=None, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO mensajes (routing_key, body, timestamp) VALUES (?, ?, datetime('now'))",
+        (msg["routing_key"], msg["body"])
+    )
+    conn.close()
+    print(f"[x] Procesado: {msg}")
 
 def callback(ch, method, properties, body):
-    routing_key = method.routing_key
-    text = body.decode()
-    is_json = False
-    try:
-        parsed = json.loads(text)
-        is_json = True
-    except json.JSONDecodeError:
-        parsed = None
+    msg = {"routing_key": method.routing_key, "body": body.decode()}
+    if filtrar_mensaje(msg["routing_key"], TIPO_CONSUMER):
+        executor.submit(procesar_msg, msg)
 
-    if is_json:
-        print(f"--- NUEVO MENSAJE ---\nRouting key: {routing_key}\nJSON: {parsed}\n")
-    else:
-        print(f"--- NUEVO MENSAJE ---\nRouting key: {routing_key}\nRaw body: {text}\nNo es JSON ❌\n")
+connection = pika.BlockingConnection(pika.ConnectionParameters("localhost"))
+channel = connection.channel()
+channel.queue_declare(queue=QUEUE)
 
-    # Guardar en SQLite
-    cursor.execute(
-        "INSERT INTO mensajes (routing_key, body, timestamp) VALUES (?, ?, ?)",
-        (routing_key, text, datetime.now().isoformat())
-    )
-    conn.commit()
+executor = ThreadPoolExecutor(max_workers=4)
 
-    # Guardar en log
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"{datetime.now().isoformat()} | {routing_key} | {text}\n")
-
-channel.basic_consume(queue=queue_name, on_message_callback=callback, auto_ack=True)
+channel.basic_consume(queue=QUEUE, on_message_callback=callback, auto_ack=True)
+print(f"[*] Consumer '{TIPO_CONSUMER}' escuchando en 'consumer_topic_all'...")
 channel.start_consuming()
